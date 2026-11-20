@@ -14,3 +14,8 @@ class TrainingInput(BaseModel):
 class ReviewInput(BaseModel):
  decision:Literal['valid','flagged']
  note:str=Field(min_length=6,max_length=2000)
+class DpQueryInput(BaseModel):
+ request_id:str=Field(min_length=4,max_length=64)
+ training_id:int=Field(ge=1)
+ holiday:Literal['all','yes','no']='all'
+ epsilon:float=Field(gt=0,le=1.0,allow_inf_nan=False)

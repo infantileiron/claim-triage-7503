@@ -2,4 +2,6 @@
 -- claims: code unique, label nullable (0 normal, 1 anomaly).
 -- trainings: frozen snapshot and holdout output JSON.
 -- reviews: training_id / claim_id foreign keys with unique source pair.
+-- privacy_ledgers: training_id primary key, fixed total epsilon and spent.
+-- dp_requests: request_id unique idempotency key, content fingerprint, state machine.
 -- Exact portable schema: src/models/entities.py.

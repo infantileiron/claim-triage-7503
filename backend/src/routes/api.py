@@ -3,11 +3,12 @@ import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from sqlalchemy.exc import IntegrityError
 from src.config.database import db
-from src.models.entities import User,Claim,Training,Review,Audit
-from src.schemas.business import Login,ClaimInput,TrainingInput,ReviewInput
+from src.models.entities import User,Claim,Training,Review,Audit,DpRequest
+from src.schemas.business import Login,ClaimInput,TrainingInput,ReviewInput,DpQueryInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
+from src.services import privacy
 from src.controllers.business import ensure_training
 router=APIRouter()
 @router.post('/auth/login')
@@ -72,3 +73,36 @@ def approve(i:int,u=Depends(admin),s=Depends(db)):
  r.status='approved';s.commit();audit(s,u,'签核复核 '+str(i));return dump(r)
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]
+@router.get('/dp-policy')
+def dp_policy(u=Depends(current)):return privacy.policy()
+@router.get('/trainings/{i}/privacy')
+def ledger(i:int,u=Depends(current),s=Depends(db)):
+ ensure_training(s,i);l=privacy.ensure_ledger(s,i)
+ return {'training_id':i,'total':l.total,'spent':round(l.spent,6),'remaining':round(l.total-l.spent,6)}
+@router.get('/dp-queries')
+def dp_queries(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(DpRequest).order_by(DpRequest.id.desc()).limit(200)]
+@router.post('/dp-queries')
+def dp_query(data:DpQueryInput,u=Depends(editor),s=Depends(db)):
+ fp=privacy.fingerprint(data.training_id,data.holiday,data.epsilon)
+ existing=s.query(DpRequest).filter_by(request_id=data.request_id).first()
+ if existing:
+  if existing.fingerprint!=fp:raise HTTPException(409,'同一单号内容不一致，已拒绝；改筛选或预算请使用新单号')
+  return dump(existing)
+ t=ensure_training(s,data.training_id)
+ if t.state!='done':raise HTTPException(409,'仅已完成训练的版本可发起隐私查询')
+ privacy.ensure_ledger(s,data.training_id)
+ r=DpRequest(request_id=data.request_id,fingerprint=fp,training_id=data.training_id,holiday=data.holiday,epsilon=data.epsilon,actor=u.email,state='accepted',charged=data.epsilon,created=privacy.now())
+ s.add(r);charged=privacy.charge(s,data.training_id,data.epsilon)
+ if not charged:r.state='failed';r.charged=0.;r.error='版本剩余预算不足本次查询'
+ try:s.commit()
+ except IntegrityError:
+  s.rollback();existing=s.query(DpRequest).filter_by(request_id=data.request_id).first()
+  if existing.fingerprint!=fp:raise HTTPException(409,'同一单号内容不一致，已拒绝；改筛选或预算请使用新单号')
+  return dump(existing)
+ if not charged:raise HTTPException(409,r.error)
+ audit(s,u,'隐私查询 '+data.request_id)
+ try:result=privacy.aggregate(t.result['snapshot'],data.holiday,data.epsilon)
+ except Exception as e:
+  privacy.fail(s,r.id,data.training_id,data.epsilon,'统计计算失败：'+str(e)[:180]);raise HTTPException(500,'统计计算失败，未发布，预算已退还')
+ row=privacy.publish(s,r.id,result)
+ return dump(row or s.get(DpRequest,r.id))

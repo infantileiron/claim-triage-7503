@@ -1,6 +1,6 @@
 # 禾序 · 报销异常分类复核
 
-财务共享组把历史人工复核标签训练成可解释的逻辑回归版本，再按异常概率排定待核票据；最终判断和签核由人员完成。原生 HTML/CSS/JS 四个业务页面：样本池、训练配置、分类评估、风险复核。
+财务共享组把历史人工复核标签训练成可解释的逻辑回归版本，再按异常概率排定待核票据；最终判断和签核由人员完成。对外共享的报销统计只发布差分隐私加噪结果，原始样本不出库。原生 HTML/CSS/JS 五个业务页面：样本池、训练配置、分类评估、风险复核、隐私共享。
 
 ## 真实模拟场景
 
@@ -22,6 +22,17 @@
 6. 09:40 生成当前版本高风险待标注样本的复核任务，重复生成不会重复添加。
 7. 10:00 analyst 复核原票据并填“核验正常”或“需进一步核实”及理由。
 8. 10:10 admin 签核人工结论；10:20 viewer 下载 `claim-triage-<版本ID>.json` 留档。
+9. 10:30 analyst 在隐私共享页对已完成版本发起查询：选节假日筛选、本次预算 ε 与查询单号，发布加噪数量与金额；页面可见受理/已发布/失败与版本剩余额度。
+
+## 差分隐私共享
+
+对外只发布加噪统计，原始样本不出库。每次查询在指定**已完成训练**的冻结快照上按节假日（全部/仅节假日/仅非节假日）聚合，分别对数量与金额加 Laplace 噪声；**空集同样加噪**，不做特殊处理。
+
+预先公开的口径（`GET /dp-policy`，改动即变更对外承诺）：单票数量贡献上限 1、单票金额贡献上限 2000 元（截断）、预算按数量/金额各 50% 分配、误差依据为 95% 误差界 = 噪声尺度 × ln20（数量尺度 1/(ε/2)，金额尺度 2000/(ε/2)）。发布结果内嵌同一口径快照，不返回原始计数或金额。
+
+预算与幂等：每版本总预算 ε=3.0 预先固定、各账号共用（`GET /trainings/{id}/privacy` 查剩余额度）；单请求 ε≤1.0。查询单号为幂等键：同一单号同一内容重试返回**原噪声**且不重复扣费；同一单号不同内容（改筛选或改预算）返回 409，须换新单号。预算扣减是账本行的原子条件更新（`spent+ε≤total`），并发发布不超支；结果可见时预算已扣。计算失败且未曝光才退还预算；服务中断恢复后，受理中未发布的单据退还预算并置为失败，**已发布结果不再退款**。
+
+验证：`test-artifacts/gb-3106/dp_test.py` 覆盖预算竞争（8 并发抢 3.0 ε 恰好 3 单发布）、空集加噪、发布后响应丢失再重试（原噪声、不重复扣费、同号异内容 409）、并发同号只扣一次、中断恢复已发布不退款及角色/状态守卫。本地无 Docker 时用 SQLite 跑：`/tmp/dpenv/bin/python -m pytest dp_test.py -v`。
 
 ## 算法与口径
 
@@ -55,9 +66,9 @@ docker compose up -d --build
 | 异步 | Redis列表队列、独立Python worker与心跳 |
 | 数据 | MySQL8.0、Redis7；Nginx反代 `/api/` 去前缀 |
 
-`frontend/src` 下 api/stores/types/components/common/hooks/pages/router/utils/constants 分离网络、状态、契约、组件、表单、页面和枚举。`backend/src` 下 routes/controllers/services/models/schemas/middlewares/utils/constants/config 分离HTTP、查询、算法、持久化、校验、授权和配置。`backend/scripts/seed_demo.py` 用自然键只插入缺失账号/报销，不覆盖人工修订。`backend/migrations/001_initial.sql` 记录初始架构，实际初始DDL由SQLAlchemy metadata建立。
+`frontend/src` 下 api/stores/types/components/common/hooks/pages/router/utils/constants 分离网络、状态、契约、组件、表单、页面和枚举。`backend/src` 下 routes/controllers/services/models/schemas/middlewares/utils/constants/config 分离HTTP、查询、算法、持久化、校验、授权和配置；差分隐私聚合与账本位于 `backend/src/services/privacy.py`。`backend/scripts/seed_demo.py` 用自然键只插入缺失账号/报销，不覆盖人工修订。`backend/migrations/001_initial.sql` 记录初始架构，实际初始DDL由SQLAlchemy metadata建立。
 
-共享枚举 ROLES/STATES/DECISIONS/LABELS 位于后端 `backend/src/constants/enums.py` 和前端 `frontend/src/constants/enums.js`；Pydantic枚举校验位于 `backend/src/schemas/business.py`，权限检查位于 `backend/src/middlewares/auth.py`。状态徽章/表格/表单字段为共享组件，两种中间件提供request ID和安全响应头；全局异常处理与审计记录横切业务。
+共享枚举 ROLES/STATES/DECISIONS/LABELS/DP_STATES/HOLIDAY_FILTERS 位于后端 `backend/src/constants/enums.py` 和前端 `frontend/src/constants/enums.js`；Pydantic枚举校验位于 `backend/src/schemas/business.py`，权限检查位于 `backend/src/middlewares/auth.py`。状态徽章/表格/表单字段为共享组件，两种中间件提供request ID和安全响应头；全局异常处理与审计记录横切业务。
 
 本地开发：启动Compose的db/redis，将DATABASE_URL和REDIS_URL改指宿主映射；Python3.11虚拟环境安装 backend/requirements.txt，在backend目录 `uvicorn src.main:app --reload`。前端建议继续用Compose Nginx以保留同源API代理，也可使用可代理 `/api` 的本地静态服务器。单独开放静态文件不能替代API代理。
 
